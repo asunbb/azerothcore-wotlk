@@ -199,6 +199,7 @@ public:
             { "playall",           HandlePlayAllCommand,           rbac::RBAC_PERM_COMMAND_PLAYALL,           Console::No  },
             { "skirmish",          HandleSkirmishCommand,          rbac::RBAC_PERM_COMMAND_SKIRMISH,          Console::No  },
             { "mailbox",           HandleMailBoxCommand,           rbac::RBAC_PERM_COMMAND_MAILBOX,           Console::No  },
+            { "bank",              HandleBankCommand,              rbac::RBAC_PERM_COMMAND_BANK,              Console::No  },
             { "string",            HandleStringCommand,            rbac::RBAC_PERM_COMMAND_STRING,            Console::No  },
             { "opendoor",          HandleOpenDoorCommand,          rbac::RBAC_PERM_COMMAND_OPENDOOR,          Console::No  },
             { "bm",                HandleBMCommand,                rbac::RBAC_PERM_COMMAND_BEASTMASTER,       Console::No  },
@@ -3380,6 +3381,12 @@ public:
     {
         Player* player = handler->GetSession()->GetPlayer();
         handler->GetSession()->SendShowMailBox(player->GetGUID());
+        return true;
+    }
+
+    static bool HandleBankCommand(ChatHandler* handler)
+    {
+        handler->GetSession()->SendShowBank(handler->GetSession()->GetPlayer()->GetGUID());
         return true;
     }
 
