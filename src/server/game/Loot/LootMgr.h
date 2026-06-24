@@ -267,7 +267,7 @@ struct QuestItem
          = default;
 
     QuestItem(uint8 _index, bool _islooted = false)
-        : index(_index), is_looted(_is_looted) {}
+        : index(_index), is_looted(_islooted) {}
 };
 
 class LootTemplate;
