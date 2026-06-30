@@ -12946,13 +12946,24 @@ void Unit::TriggerAurasProcOnEvent(ProcEventInfo& eventInfo, AuraApplicationProc
         SetCantProc(false);
 }
 
+// 获取负责持有「法术修饰(SpellMod)」的玩家对象。
+// 法术修饰系统（天赋/雕文/套装触发的施法时间、消耗、暴击、跳数等修正）只挂在 Player 上，
+// 因此宠物/守护者/临时召唤物施法时，需要回溯到其控制者玩家，才能正确应用这些修饰。
+//
+// 查找优先级：
+//   1. 本身就是玩家 → 直接返回；
+//   2. 有主人(GetOwner)且主人为玩家（宠物/守护者情形）→ 返回主人；
+//   3. 术士「基尔罗格之眼」特例：它没有常规 owner，需经 TempSummon 取召唤者；
+//   4. 都不满足（如纯 NPC 怪物）→ 返回 nullptr，表示该次施法不受任何玩家 SpellMod 影响。
 Player* Unit::GetSpellModOwner() const
 {
+    // 情形 1：自身即玩家，直接返回
     if (Player* player = const_cast<Unit*>(this)->ToPlayer())
     {
         return player;
     }
 
+    // 情形 2：通过 owner 链回溯到玩家（宠物 → 玩家主人）
     if (Unit* owner = GetOwner())
     {
         if (Player* player = owner->ToPlayer())
@@ -12962,6 +12973,8 @@ Player* Unit::GetSpellModOwner() const
     }
 
     // Special handling for Eye of Kilrogg
+    // 情形 3：基尔罗格之眼（NPC_EYE_OF_KILROGG）是临时召唤物，但 owner 链取不到玩家，
+    //          改用 TempSummon::GetSummonerUnit() 找到施放该眼的术士玩家。
     if (GetEntry() == NPC_EYE_OF_KILROGG)
     {
         if (TempSummon const* tempSummon = ToTempSummon())
@@ -12973,6 +12986,7 @@ Player* Unit::GetSpellModOwner() const
         }
     }
 
+    // 情形 4：无玩家归属（普通怪物/由 NPC 召唤的生物），不受玩家 SpellMod 影响
     return nullptr;
 }
 
