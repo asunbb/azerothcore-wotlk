@@ -3744,26 +3744,65 @@ void Spell::cancel(bool bySelf)
     finish(false);
 }
 
+// 法术施放公共入口（_cast 的包装器）。
+// 唯一职责：处理「正在被修饰的法术」状态的保存与恢复，保证 _cast 内部可以干净地开启/关闭
+// 当前法术的 SpellMod 收集，而不会与调用方已经挂起的法术修饰上下文冲突。
+//
+// 背景：玩家有一个单值 m_spellModTakingSpell，标记「当前正在施放、需要收集修饰的法术」。
+// _cast 内部会对 this 反复调用 SetSpellModTakingSpell(this, true/false)。
+// 但本函数可能是在另一个法术的施放过程中被递归触发的（如触发法术、连锁法术），
+// 此时 m_spellModTakingSpell 仍指向上一个法术。为避免 _cast 误用该旧值：
+//   1. 进入前保存 lastMod，并把 m_spellModTakingSpell 暂时清空（置 false）；
+//   2. 执行 _cast；
+//   3. 离开后恢复 lastMod（置 true），还原调用方的上下文。
 void Spell::cast(bool skipCheck)
 {
     Player* modOwner = m_caster->GetSpellModOwner();
     Spell* lastMod = nullptr;
     if (modOwner)
     {
+        // 记录调用方当前挂起的「修饰中法术」，并暂时解除，让 _cast 从干净状态开始
         lastMod = modOwner->m_spellModTakingSpell;
         if (lastMod)
             modOwner->SetSpellModTakingSpell(lastMod, false);
     }
 
+    // 真正的施法执行（目标选取、校验、消耗、发射、proc、脚本钩子等）
     _cast(skipCheck);
 
     if (lastMod)
+        // 还原调用方原有的「修饰中法术」上下文
         modOwner->SetSpellModTakingSpell(lastMod, true);
 }
 
+// 实际施法执行主体（由 cast() 包装调用）。
+// 这是法术系统的核心调度函数，按以下阶段顺序执行（任一阶段失败通常会提前 return）：
+//
+//   阶段 A. 指针刷新与目标有效性校验（UpdatePointers / 目标丢失 / DISMISS_PET_FIRST）
+//   阶段 B. 玩家施法者预处理（OnPlayerSpellCast 脚本钩子 + 宠物协助攻击）
+//   阶段 C. 朝向修正 + CallScriptBeforeCastHandlers
+//   阶段 D. 最终施法校验（CheckCast）+ 交易物品特殊处理
+//   阶段 E. 目标选取（SelectSpellTargets）—— 开启 SpellMod 收集以应用目标相关修饰
+//   阶段 F. 命中前触发器准备 + CallScriptOnCastHandlers + 成就更新
+//   阶段 G. 扣除资源/法力/材料 + 设置冷却
+//   阶段 H. 发射阶段（HandleLaunchPhase）+ 广播 SMSG_SPELL_GO
+//   阶段 I. 近战计时器重置判定 + 「延迟(投射物)/立即」分支：
+//            - 有飞行速度且非引导 → 进入 SPELL_STATE_DELAYED，等投射物到达；
+//            - 否则 → handle_immediate() 立即处理效果。
+//   阶段 J. 近战计时器重置执行 + CallScriptAfterCastHandlers
+//   阶段 K. CAST 阶段 proc（仅非触发法术）+ 法术连锁(spell_linked) + 打断属性 +
+//           作弊无冷却 + OnSpellCast 脚本钩子 + CreatureAI::OnSpellCast
+//
+// 其中多次出现 SetSpellModTakingSpell(this, true/false) 的开关：
+// true 表示「当前正在处理 this 的施法，相关 Player 法术修饰(SpellMod)应作用于它」。
+// 关键点：在那些会消耗/应用法术修饰（目标数、施法时间、消耗等）的区段开启 true，
+// 在会触发其它法术/脚本回调的区段关闭 false，避免误把修饰算到被触发法术头上。
 void Spell::_cast(bool skipCheck)
 {
+    // ===== 阶段 A：指针刷新与目标有效性校验 =====
+
     // update pointers base at GUIDs to prevent access to non-existed already object
+    // 把缓存的目标 GUID 重新解析为对象指针；若期间对象已消失则取消施法
     if (!UpdatePointers())
     {
         // cancel the spell if UpdatePointers() returned false, something wrong happened there
@@ -3772,6 +3811,7 @@ void Spell::_cast(bool skipCheck)
     }
 
     // cancel at lost explicit target during cast
+    // 施法期间显式目标已不存在（死亡/消失）→ 取消
     if (m_targets.GetObjectTargetGUID() && !m_targets.GetObjectTarget())
     {
         cancel();
@@ -3779,6 +3819,7 @@ void Spell::_cast(bool skipCheck)
     }
 
     // Xinef: implement attribute SPELL_ATTR1_DISMISS_PET_FIRST, on spell cast current pet is dismissed and charms are removed
+    // SPELL_ATTR1_DISMISS_PET_FIRST：施放该法术前先解散当前宠物、解除魅魔效果（如坐骑）
     if (m_spellInfo->HasAttribute(SPELL_ATTR1_DISMISS_PET_FIRST))
     {
         if (m_caster->IsPlayer() && !m_spellInfo->HasEffect(SPELL_EFFECT_SUMMON_PET))
@@ -3789,16 +3830,20 @@ void Spell::_cast(bool skipCheck)
             charm->RemoveAurasByType(SPELL_AURA_MOD_CHARM, m_caster->GetGUID());
     }
 
+    // ===== 阶段 B：玩家施法者预处理（脚本钩子 + 宠物协助攻击）=====
     if (Player* playerCaster = m_caster->ToPlayer())
     {
         // now that we've done the basic check, now run the scripts
         // should be done before the spell is actually executed
+        // 玩家施法脚本钩子（PlayerScript::OnPlayerSpellCast），在真正施法前运行
         sScriptMgr->OnPlayerSpellCast(playerCaster, this, skipCheck);
 
         // As of 3.0.2 pets begin attacking their owner's target immediately
         // Let any pets know we've attacked something. Check DmgClass for harmful spells only
         // This prevents spells such as Hunter's Mark from triggering pet attack
         // xinef: take into account SPELL_ATTR3_SUPPRESS_TARGET_PROCS
+        // 玩家对单位施放有害法术时，通知宠物/守护者协助攻击该目标
+        // （仅 DmgClass != NONE 的有害法术，排除猎人标记等）
         if ((m_targets.GetTargetMask() & TARGET_FLAG_UNIT) && GetSpellInfo()->DmgClass != SPELL_DAMAGE_CLASS_NONE && !GetSpellInfo()->HasAttribute(SPELL_ATTR3_SUPPRESS_TARGET_PROCS))
             if (!playerCaster->m_Controlled.empty())
                 for (Unit::ControlSet::iterator itr = playerCaster->m_Controlled.begin(); itr != playerCaster->m_Controlled.end(); ++itr)
@@ -3807,21 +3852,30 @@ void Spell::_cast(bool skipCheck)
                             pet->ToCreature()->AI()->OwnerAttacked(m_targets.GetUnitTarget());
     }
 
+    // 标记该法术正在执行（防止重入/重复触发）
     SetExecutedCurrently(true);
 
+    // ===== 阶段 C：朝向修正 + BeforeCast 脚本钩子 =====
+
+    // 生物施法需面向目标（非触发忽略朝向的情况除外）
     if (!HasTriggeredCastFlag(TRIGGERED_IGNORE_SET_FACING))
         if (m_caster->IsCreature() && m_targets.GetObjectTarget() && m_caster != m_targets.GetObjectTarget())
             m_caster->SetInFront(m_targets.GetObjectTarget());
 
+    // SpellScript 的 BeforeCast 回调
     CallScriptBeforeCastHandlers();
 
     Player* modOwner = m_caster->GetSpellModOwner();
+    // ===== 阶段 D：最终施法校验（CheckCast）+ 交易物品处理 =====
     // skip check if done already (for instant cast spells for example)
+    // skipCheck=true 表示前置已校验过（如瞬发法术），跳过重复校验
     if (!skipCheck)
     {
+        // 施法进度条走完后的最终校验（距离/法力/冷却/状态等）
         SpellCastResult castResult = CheckCast(false);
         if (castResult != SPELL_CAST_OK)
         {
+            // 校验失败：通知客户端、中断、收尾并退出
             SendCastResult(castResult);
             SendInterrupted(0);
 
@@ -3832,6 +3886,8 @@ void Spell::_cast(bool skipCheck)
 
         // additional check after cast bar completes (must not be in CheckCast)
         // if trade not complete then remember it in trade data
+        // 目标是「交易栏物品」且交易尚未进入确认阶段：把法术暂存到交易数据中，
+        // 等交易完成时再施放，此处静默忽略
         if (m_targets.GetTargetMask() & TARGET_FLAG_TRADE_ITEM)
         {
             if (m_caster->IsPlayer())
@@ -3854,16 +3910,21 @@ void Spell::_cast(bool skipCheck)
         }
     }
 
+    // ===== 阶段 E：目标选取（SelectSpellTargets）=====
+    // 开启 SpellMod 收集：目标数等修饰需在此阶段生效
     if (modOwner)
         modOwner->SetSpellModTakingSpell(this, true);
 
+    // 还未选取过目标则选取（AOE/链式/友方敌方判定等）
     if (!_spellTargetsSelected)
         SelectSpellTargets();
 
+    // 关闭 SpellMod 收集，避免后续脚本回调误用
     if (modOwner)
         modOwner->SetSpellModTakingSpell(this, false);
 
     // Spell may be finished after target map check
+    // 目标筛选后法术可能已被脚本标记为结束（如目标列表为空）→ 收尾退出
     if (m_spellState == SPELL_STATE_FINISHED)
     {
         SendInterrupted(0);
@@ -3872,11 +3933,14 @@ void Spell::_cast(bool skipCheck)
         return;
     }
 
+    // ===== 阶段 F：命中前触发器 + OnCast 脚本钩子 =====
     if (modOwner)
         modOwner->SetSpellModTakingSpell(this, true);
 
+    // 准备“命中目标时触发”的衍生法术（proc trigger spell 等）
     PrepareTriggersExecutedOnHit();
 
+    // SpellScript 的 OnCast 回调
     CallScriptOnCastHandlers();
 
     if (modOwner)
@@ -3884,48 +3948,67 @@ void Spell::_cast(bool skipCheck)
 
     // traded items have trade slot instead of guid in m_itemTargetGUID
     // set to real guid to be sent later to the client
+    // 交易物品目标由交易栏槽位转回真实 GUID，供后续包发送
     m_targets.UpdateTradeSlotItem();
 
+    // ===== 阶段 F（续）：成就更新 =====
     if (m_caster->IsPlayer())
     {
         if (!HasTriggeredCastFlag(TRIGGERED_IGNORE_CAST_ITEM) && m_CastItem)
         {
+            // 使用物品触发的施法：更新物品相关计时成就与“使用物品”成就
             m_caster->ToPlayer()->StartTimedAchievement(ACHIEVEMENT_TIMED_TYPE_ITEM, m_CastItem->GetEntry());
             m_caster->ToPlayer()->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_USE_ITEM, m_CastItem->GetEntry());
         }
 
+        // 更新“施放法术”成就（携带目标作为可选参数）
         m_caster->ToPlayer()->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_CAST_SPELL, m_spellInfo->Id, 0, (m_targets.GetUnitTarget() ? m_targets.GetUnitTarget() : m_caster));
     }
 
+    // ===== 阶段 G：扣除资源/法力/材料 + 设置冷却 =====
     if (!HasTriggeredCastFlag(TRIGGERED_IGNORE_POWER_AND_REAGENT_COST))
     {
         // Powers have to be taken before SendSpellGo
+        // 法力/怒气/能量等必须在 SendSpellGo 之前扣除
         TakePower();
         TakeReagents();                                         // we must remove reagents before HandleEffects to allow place crafted item in same slot
     }
     else if (Item* targetItem = m_targets.GetItemTarget())
     {
         /// Not own traded item (in trader trade slot) req. reagents including triggered spell case
+        // 即使是触发法术，对“非自身的交易栏物品”施放仍需消耗材料
         if (targetItem->GetOwnerGUID() != m_caster->GetGUID())
             TakeReagents();
     }
 
+    // 设置法术冷却（必须在扣除资源后、广播前）
     SendSpellCooldown();
 
+    // ===== 阶段 H：发射阶段（HandleLaunchPhase）+ 广播 SMSG_SPELL_GO =====
     // CAST SPELL
     if (modOwner)
         modOwner->SetSpellModTakingSpell(this, true);
 
+    // 准备 SpellScript 命中处理器的注册（BeforeHit/OnHit/AfterHit 等）
     PrepareScriptHitHandlers();
 
+    // 发射阶段：为每个目标调用 OnEffectLaunch / HandleLaunchPhase，
+    // 计算并暂存命中前的效果（伤害、投射物动画等），但尚未真正作用于目标
     HandleLaunchPhase();
 
     // we must send smsg_spell_go packet before m_castItem delete in TakeCastItem()...
+    // 广播施法开始包给附近玩家（必须在 TakeCastItem 前发，否则物品已销毁）
     SendSpellGo();
 
+    // ===== 阶段 I：近战计时器重置判定 + 「延迟(投射物)/立即」分支 =====
+
+    // 多数法术施放后会重置近战攻击计时器；先判断本法术是否属于“自动动作重置”类，
+    // 并排除带 SPELL_ATTR2_DO_NOT_RESET_COMBAT_TIMERS 的法术
     bool resetAttackTimers = IsAutoActionResetSpell() && !m_spellInfo->HasAttribute(SPELL_ATTR2_DO_NOT_RESET_COMBAT_TIMERS);
     if (resetAttackTimers)
     {
+        // 检查是否存在“忽略近战重置”的光环(SPELL_AURA_IGNORE_MELEE_RESET)作用于本法术，
+        // 若有则不重置（如某些附魔/光环保护近战节奏）
         Unit::AuraEffectList const& vIgnoreReset = m_caster->GetAuraEffectsByType(SPELL_AURA_IGNORE_MELEE_RESET);
         for (Unit::AuraEffectList::const_iterator i = vIgnoreReset.begin(); i != vIgnoreReset.end(); ++i)
         {
@@ -3938,39 +4021,48 @@ void Spell::_cast(bool skipCheck)
     }
 
     // Okay, everything is prepared. Now we need to distinguish between immediate and evented delayed spells
+    // 有飞行速度且非引导 → 投射物法术：现在只做“发射”，效果延迟到投射物命中时再结算
     if ((m_spellInfo->Speed > 0.0f && !m_spellInfo->IsChanneled())/* xinef: we dont need this || m_spellInfo->Id == 14157*/)
     {
         // Remove used for cast item if need (it can be already nullptr after TakeReagents call
         // in case delayed spell remove item at cast delay start
+        // 投射物法术在此处移除施法消耗物品（延迟命中前销毁）
         TakeCastItem();
 
         // Okay, maps created, now prepare flags
+        // 标记为延迟态：等待 SetDelayStart 触发的投射物飞行计时
         m_immediateHandled = false;
         m_spellState = SPELL_STATE_DELAYED;
         SetDelayStart(0);
 
+        // 若施法者已无其它正在施放的非近战法术，清除施法状态标记
         if (m_caster->HasUnitState(UNIT_STATE_CASTING) && !m_caster->IsNonMeleeSpellCast(false, false, true))
             m_caster->ClearUnitState(UNIT_STATE_CASTING);
 
         // remove all applied mods at this point
         // dont allow user to use them twice in case spell did not reach current target
+        // 投射物可能永远到不了目标，此处移除已应用的法术修饰，防止被重复利用
         if (modOwner)
             modOwner->RemoveSpellMods(this);
 
         // Xinef: why do we keep focus after spell is sent to air?
         // Xinef: Because of this, in the middle of some animation after setting targetguid to 0 etc
         // Xinef: we get focused to it out of nowhere...
+        // 生物施法者释放投射物后解除对该法术的“聚焦”，避免动画中途被莫名重新聚焦
         if (Creature* creatureCaster = m_caster->ToCreature())
             creatureCaster->ReleaseFocus(this);
     }
     else
     {
         // Immediate spell, no big deal
+        // 无飞行速度：立即法术，同步处理所有效果与命中
         handle_immediate();
     }
 
+    // ===== 阶段 J：近战计时器重置执行 + AfterCast 脚本钩子 =====
     if (resetAttackTimers)
     {
+        // 原本有施法时间但被 spellmod 压到 0 的法术不再重置计时器（避免瞬发滥用）
         if (m_casttime == 0 && m_spellInfo->CalcCastTime())
         {
             resetAttackTimers = false;
@@ -3978,6 +4070,7 @@ void Spell::_cast(bool skipCheck)
 
         if (resetAttackTimers)
         {
+            // 重置主手/副手/远程攻击计时器，使施法后近战节奏回到起点
             m_caster->resetAttackTimer(BASE_ATTACK);
 
             if (m_caster->HasOffhandWeaponForAttack())
@@ -3989,19 +4082,24 @@ void Spell::_cast(bool skipCheck)
         }
     }
 
+    // SpellScript 的 AfterCast 回调
     CallScriptAfterCastHandlers();
 
+    // 关闭 SpellMod 收集（施法主体的修饰应用已全部结束）
     if (modOwner)
         modOwner->SetSpellModTakingSpell(this, false);
 
+    // ===== 阶段 K：CAST 阶段 proc（仅非触发法术）=====
     // Handle procs on cast - only for non-triggered spells
     // Triggered spells (from auras, items, etc.) should not fire CAST phase procs
     // as they are not player-initiated casts. This prevents issues like Arcane Potency
     // charges being consumed by periodic damage effects (e.g., Blizzard ticks).
     // Must be called AFTER handle_immediate() so spell mods (like Missile Barrage's
     // duration reduction) are applied before the aura is consumed by the proc.
+    // 触发法术不参与 CAST 阶段 proc，避免如暴风雪周期伤害误消耗“奥术潜能”等施法触发电荷
     if (m_originalCaster && !IsTriggered())
     {
+        // 确定攻击方 proc 标志：按正负效果与魔法/非魔法伤害类别归类
         uint32 procAttacker = m_procAttacker;
         if (!procAttacker)
         {
@@ -4016,6 +4114,7 @@ void Spell::_cast(bool skipCheck)
             }
         }
 
+        // 扫描目标命中结果：只要任一目标暴击命中，则在命中掩码中置入 CRITICAL 标志
         uint32 hitMask = PROC_HIT_NORMAL;
 
         for (std::list<TargetInfo>::iterator ihit = m_UniqueTargetInfo.begin(); ihit != m_UniqueTargetInfo.end(); ++ihit)
@@ -4030,10 +4129,14 @@ void Spell::_cast(bool skipCheck)
             break;
         }
 
+        // 触发施法阶段的 proc（ProcSkillsAndAuras，CAST 阶段）
         Unit::ProcSkillsAndAuras(m_originalCaster, nullptr, procAttacker, PROC_FLAG_NONE, hitMask, 1, BASE_ATTACK, m_spellInfo, m_triggeredByAuraSpell.spellInfo,
             m_triggeredByAuraSpell.effectIndex, this, nullptr, nullptr, PROC_SPELL_PHASE_CAST);
     }
 
+    // ===== 阶段 K（续）：法术连锁(spell_linked) =====
+    // 查 spell_linked 表：与本法术关联的“连锁法术”——
+    //   正 ID → 施放该法术；负 ID → 移除该法术的光环
     if (std::vector<int32> const* spell_triggered = sSpellMgr->GetSpellLinked(m_spellInfo->Id))
     {
         for (int32 id : *spell_triggered)
@@ -4045,22 +4148,30 @@ void Spell::_cast(bool skipCheck)
         }
     }
 
+    // ===== 阶段 K（续）：打断施法属性 =====
     // Interrupt Spell casting
     // handle this here, in other places SpellHitTarget can be set to nullptr, if there is an error in this function
+    // 带有“可造成打断”属性的法术，对生物目标施加打断效果（32747）
     if (m_spellInfo->HasAttribute(SPELL_ATTR7_CAN_CAUSE_INTERRUPT))
         if (Unit* target = m_targets.GetUnitTarget())
             if (target->IsCreature())
                 m_caster->CastSpell(target, 32747, true);
 
+    // ===== 阶段 K（续）：作弊模式无冷却 =====
+    // 玩家开启 CHEAT_COOLDOWN 时，施放后立即移除该法术冷却
     if (m_caster->IsPlayer())
         if (m_caster->ToPlayer()->GetCommandStatus(CHEAT_COOLDOWN))
             m_caster->ToPlayer()->RemoveSpellCooldown(m_spellInfo->Id, true);
 
+    // ===== 阶段 K（续）：施法完成脚本钩子 + 收尾 =====
+    // 通用施法完成脚本钩子（ScriptMgr::OnSpellCast）
     sScriptMgr->OnSpellCast(this, m_caster, m_spellInfo, skipCheck);
 
+    // 解除“正在执行”标记
     SetExecutedCurrently(false);
 
     // Call CreatureAI hook on successful cast
+    // 生物施法者调用 AI 的 OnSpellCast 钩子
     if (Creature* caster = m_caster->ToCreature())
         if (caster->IsAIEnabled)
             caster->AI()->OnSpellCast(GetSpellInfo());
