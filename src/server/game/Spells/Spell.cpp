@@ -8064,48 +8064,76 @@ Unit* Spell::GetOriginalTarget() const
     return ObjectAccessor::GetUnit(*m_caster, m_originalTargetGUID);
 }
 
+// 刷新本 Spell 缓存的对象指针（由 GUID 重新解析为活对象）。
+// 施法准备期记录的是 GUID 等稳定标识，但进度条/投射物飞行期间，对象可能被移除、
+// 登出、传送或随载具移动，缓存的原始指针会失效。本函数在真正施法（_cast）开始前
+// 重新据 GUID 解析当前有效对象，保证后续效果处理不访问悬空指针。
+//
+// 刷新内容：
+//   1. m_originalCaster —— 原始施法者（触发法术时可能与 m_caster 不同）
+//   2. m_CastItem       —— 施法消耗物品（找不到则返回 false，取消施法）
+//   3. m_targets        —— 显式目标指针 + 载具坐标更新
+//   4. m_destTargets[]  —— 各效果目标地点，绑载具者按载具当前位置重算
+//
+// 返回值：true=可继续施法；false=施法物品丢失，应取消本次施法。
 bool Spell::UpdatePointers()
 {
+    // —— 1. 刷新原始施法者 m_originalCaster ——
     if (m_originalCasterGUID == m_caster->GetGUID())
+        // 原始施法者就是当前施法者自身（最常见情形），直接复用
         m_originalCaster = m_caster;
     else
     {
+        // 触发法术等情形：原始施法者与当前施法者不同（图腾/守护者施放），
+        // 通过 GUID 在世界中重新查找该 Unit
         m_originalCaster = ObjectAccessor::GetUnit(*m_caster, m_originalCasterGUID);
         if (m_originalCaster && !m_originalCaster->IsInWorld())
+            // 对象已不在世界中（登出/被移除），置空以避免使用
             m_originalCaster = nullptr;
     }
 
+    // —— 2. 刷新施法物品 m_CastItem ——
     if (m_castItemGUID && m_caster->IsPlayer())
     {
         m_CastItem = m_caster->ToPlayer()->GetItemByGuid(m_castItemGUID);
         // cast item not found, somehow the item is no longer where we expected
+        // 物品已不在原位（被移动/消耗）→ 返回 false，调用方（_cast）取消施法
         if (!m_CastItem)
             return false;
     }
     else
+        // 无施法物品或施法者非玩家，置空
         m_CastItem = nullptr;
 
+    // —— 3. 刷新显式目标（单位/物品指针，并按载具移动更新源/目的坐标）——
     m_targets.Update(m_caster);
 
     // further actions done only for dest targets
+    // —— 4. 刷新各效果的目标地点（仅当存在目的坐标时才需要）——
     if (!m_targets.HasDst())
         return true;
 
     // cache last transport
+    // 缓存上一次查到的载具对象，多数效果的 _transportGUID 相同，避免重复查找
     WorldObject* transport = nullptr;
 
     // update effect destinations (in case of moved transport dest target)
+    // 遍历每个效果的目标地点，对绑定载具的地点按载具当前位置重新计算绝对坐标
     for (uint8 effIndex = 0; effIndex < MAX_SPELL_EFFECTS; ++effIndex)
     {
         SpellDestination& dest = m_destTargets[effIndex];
+        // 未绑定载具的地点无需刷新
         if (!dest._transportGUID)
             continue;
 
+        // 载具与上一次不同才重新查找（命中缓存的快速路径）
         if (!transport || transport->GetGUID() != dest._transportGUID)
             transport = ObjectAccessor::GetWorldObject(*m_caster, dest._transportGUID);
 
         if (transport)
         {
+            // 先定位到载具当前位置，再叠加记录的载具相对偏移，
+            // 得到目标地点的最新绝对坐标
             dest._position.Relocate(transport);
             dest._position.RelocateOffset(dest._transportOffset);
         }
